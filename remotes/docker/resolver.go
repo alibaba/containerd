@@ -498,6 +498,10 @@ func (r *dockerBase) fetchTokenWithOAuth(ctx context.Context, to tokenOptions) (
 		return "", fmt.Errorf("unable to decode token response: %s", err)
 	}
 
+	if tr.AccessToken == "" {
+		return r.getToken(ctx, to)
+	}
+
 	return tr.AccessToken, nil
 }
 
