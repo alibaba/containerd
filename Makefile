@@ -1,103 +1,252 @@
-BUILDTAGS=
+#   Copyright The containerd Authors.
 
-PROJECT=github.com/docker/containerd
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
 
-GIT_COMMIT := $(shell git rev-parse HEAD 2> /dev/null || true)
-GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2> /dev/null)
+#       http://www.apache.org/licenses/LICENSE-2.0
 
-LDFLAGS := -X github.com/docker/containerd.GitCommit=${GIT_COMMIT} ${LDFLAGS}
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
 
-TEST_TIMEOUT ?= 5m
-TEST_SUITE_TIMEOUT ?= 10m
 
-RUNTIME ?= runc
+# Root directory of the project (absolute path).
+ROOTDIR=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-# if this session isn't interactive, then we don't want to allocate a
-# TTY, which would fail, but if it is interactive, we do want to attach
-# so that the user can send e.g. ^C through.
-INTERACTIVE := $(shell [ -t 0 ] && echo 1 || echo 0)
-ifeq ($(INTERACTIVE), 1)
-	DOCKER_FLAGS += -t
+# Base path used to install.
+DESTDIR=/usr/local
+
+# Used to populate variables in version package.
+VERSION=$(shell git describe --match 'v[0-9]*' --dirty='.m' --always)
+REVISION=$(shell git rev-parse HEAD)$(shell if ! git diff --no-ext-diff --quiet --exit-code; then echo .m; fi)
+
+ifneq "$(strip $(shell command -v go 2>/dev/null))" ""
+	GOOS ?= $(shell go env GOOS)
+	GOARCH ?= $(shell go env GOARCH)
+else
+	ifeq ($(GOOS),)
+		# approximate GOOS for the platform if we don't have Go and GOOS isn't
+		# set. We leave GOARCH unset, so that may need to be fixed.
+		ifeq ($(OS),Windows_NT)
+			GOOS = windows
+		else
+			UNAME_S := $(shell uname -s)
+			ifeq ($(UNAME_S),Linux)
+				GOOS = linux
+			endif
+			ifeq ($(UNAME_S),Darwin)
+				GOOS = darwin
+			endif
+			ifeq ($(UNAME_S),FreeBSD)
+				GOOS = freebsd
+			endif
+		endif
+	else
+		GOOS ?= $$GOOS
+		GOARCH ?= $$GOARCH
+	endif
 endif
 
-TESTBENCH_ARTIFACTS_DIR := output/test-artifacts
-TESTBENCH_BUNDLE_DIR := $(TESTBENCH_ARTIFACTS_DIR)/archives
+WHALE = "🇩"
+ONI = "👹"
 
-DOCKER_IMAGE := containerd-dev$(if $(GIT_BRANCH),:$(GIT_BRANCH))
-DOCKER_RUN := docker run --privileged --rm -i $(DOCKER_FLAGS) "$(DOCKER_IMAGE)"
+RELEASE=containerd-$(VERSION:v%=%).${GOOS}-${GOARCH}
 
+PKG=github.com/containerd/containerd
 
-export GOPATH:=$(CURDIR)/vendor:$(GOPATH)
+# Project packages.
+PACKAGES=$(shell go list ./... | grep -v /vendor/)
+INTEGRATION_PACKAGE=${PKG}
+TEST_REQUIRES_ROOT_PACKAGES=$(filter \
+    ${PACKAGES}, \
+    $(shell \
+	for f in $$(git grep -l testutil.RequiresRoot | grep -v Makefile); do \
+		d="$$(dirname $$f)"; \
+		[ "$$d" = "." ] && echo "${PKG}" && continue; \
+		echo "${PKG}/$$d"; \
+	done | sort -u) \
+    )
 
-all: client daemon shim
+# Project binaries.
+COMMANDS=ctr containerd containerd-stress containerd-release
+MANPAGES=ctr.1 containerd.1 config.toml.5 containerd-config.1
 
-static: client-static daemon-static shim-static
+# Build tags seccomp and apparmor are needed by CRI plugin.
+BUILDTAGS ?= seccomp apparmor
+GO_TAGS=$(if $(BUILDTAGS),-tags "$(BUILDTAGS)",)
+GO_LDFLAGS=-ldflags '-s -w -X $(PKG)/version.Version=$(VERSION) -X $(PKG)/version.Revision=$(REVISION) -X $(PKG)/version.Package=$(PKG) $(EXTRA_LDFLAGS)'
+SHIM_GO_LDFLAGS=-ldflags '-s -w -X $(PKG)/version.Version=$(VERSION) -X $(PKG)/version.Revision=$(REVISION) -X $(PKG)/version.Package=$(PKG) -extldflags "-static"'
 
-bin:
-	mkdir -p bin/
+#Replaces ":" (*nix), ";" (windows) with newline for easy parsing
+GOPATHS=$(shell echo ${GOPATH} | tr ":" "\n" | tr ";" "\n")
 
-clean:
-	rm -rf bin && rm -rf output
+TESTFLAGS_RACE=
+GO_BUILD_FLAGS=
+# See Golang issue re: '-trimpath': https://github.com/golang/go/issues/13809
+GO_GCFLAGS=$(shell				\
+	set -- ${GOPATHS};			\
+	echo "-gcflags=-trimpath=$${1}/src";	\
+	)
 
-client: bin
-	cd ctr && go build -ldflags "${LDFLAGS}" -o ../bin/ctr
+#include platform specific makefile
+-include Makefile.$(GOOS)
 
-client-static:
-	cd ctr && go build -ldflags "-w -extldflags -static ${LDFLAGS}" -tags "$(BUILDTAGS)" -o ../bin/ctr
+BINARIES=$(addprefix bin/,$(COMMANDS))
 
-daemon: bin
-	cd containerd && go build -ldflags "${LDFLAGS}"  -tags "$(BUILDTAGS)" -o ../bin/containerd
+# Flags passed to `go test`
+TESTFLAGS ?= -v $(TESTFLAGS_RACE)
+TESTFLAGS_PARALLEL ?= 8
 
-daemon-static:
-	cd containerd && go build -ldflags "-w -extldflags -static ${LDFLAGS}" -tags "$(BUILDTAGS)" -o ../bin/containerd
+.PHONY: clean all AUTHORS build binaries test integration generate protos checkprotos coverage ci check help install uninstall vendor release mandir install-man
+.DEFAULT: default
 
-shim: bin
-	cd containerd-shim && go build -tags "$(BUILDTAGS)" -ldflags "-w" -o ../bin/containerd-shim
+all: binaries
 
-shim-static:
-	cd containerd-shim && go build -ldflags "-w -extldflags -static ${LDFLAGS}" -tags "$(BUILDTAGS)" -o ../bin/containerd-shim
+check: proto-fmt ## run all linters
+	@echo "$(WHALE) $@"
+	gometalinter --config .gometalinter.json ./...
 
-$(TESTBENCH_BUNDLE_DIR)/busybox.tar:
-	mkdir -p $(TESTBENCH_BUNDLE_DIR)
-	curl -sSL 'https://github.com/jpetazzo/docker-busybox/raw/buildroot-2014.11/rootfs.tar' -o $(TESTBENCH_BUNDLE_DIR)/busybox.tar
+ci: check binaries checkprotos coverage coverage-integration ## to be used by the CI
 
-bundles-rootfs: $(TESTBENCH_BUNDLE_DIR)/busybox.tar
+AUTHORS: .mailmap .git/HEAD
+	git log --format='%aN <%aE>' | sort -fu > $@
 
-dbuild: $(TESTBENCH_BUNDLE_DIR)/busybox.tar
-	@docker build --rm --force-rm -t "$(DOCKER_IMAGE)" .
+generate: protos
+	@echo "$(WHALE) $@"
+	@PATH=${ROOTDIR}/bin:${PATH} go generate -x ${PACKAGES}
 
-dtest: dbuild
-	$(DOCKER_RUN) make test
+protos: bin/protoc-gen-gogoctrd ## generate protobuf
+	@echo "$(WHALE) $@"
+	@PATH=${ROOTDIR}/bin:${PATH} protobuild --quiet ${PACKAGES}
 
-dbench: dbuild
-	$(DOCKER_RUN) make bench
+check-protos: protos ## check if protobufs needs to be generated again
+	@echo "$(WHALE) $@"
+	@test -z "$$(git status --short | grep ".pb.go" | tee /dev/stderr)" || \
+		((git diff | cat) && \
+		(echo "$(ONI) please run 'make protos' when making changes to proto files" && false))
 
-install:
-	cp bin/* /usr/local/bin/
+check-api-descriptors: protos ## check that protobuf changes aren't present.
+	@echo "$(WHALE) $@"
+	@test -z "$$(git status --short | grep ".pb.txt" | tee /dev/stderr)" || \
+		((git diff $$(find . -name '*.pb.txt') | cat) && \
+		(echo "$(ONI) please run 'make protos' when making changes to proto files and check-in the generated descriptor file changes" && false))
 
-protoc:
-	protoc -I ./api/grpc/types ./api/grpc/types/api.proto --go_out=plugins=grpc:api/grpc/types
+proto-fmt: ## check format of proto files
+	@echo "$(WHALE) $@"
+	@test -z "$$(find . -path ./vendor -prune -o -path ./protobuf/google/rpc -prune -o -name '*.proto' -type f -exec grep -Hn -e "^ " {} \; | tee /dev/stderr)" || \
+		(echo "$(ONI) please indent proto files with tabs only" && false)
+	@test -z "$$(find . -path ./vendor -prune -o -name '*.proto' -type f -exec grep -Hn "Meta meta = " {} \; | grep -v '(gogoproto.nullable) = false' | tee /dev/stderr)" || \
+		(echo "$(ONI) meta fields in proto files must have option (gogoproto.nullable) = false" && false)
 
-fmt:
-	@gofmt -s -l . | grep -v vendor | grep -v .pb. | tee /dev/stderr
+build: ## build the go packages
+	@echo "$(WHALE) $@"
+	@go build ${GO_GCFLAGS} ${GO_BUILD_FLAGS} ${EXTRA_FLAGS} ${GO_LDFLAGS} ${PACKAGES}
 
-lint:
-	@hack/validate-lint
+test: ## run tests, except integration tests and tests that require root
+	@echo "$(WHALE) $@"
+	@go test ${TESTFLAGS} $(filter-out ${INTEGRATION_PACKAGE},${PACKAGES})
 
-shell: dbuild
-	$(DOCKER_RUN) bash
+root-test: ## run tests, except integration tests
+	@echo "$(WHALE) $@"
+	@go test ${TESTFLAGS} $(filter-out ${INTEGRATION_PACKAGE},${TEST_REQUIRES_ROOT_PACKAGES}) -test.root
 
-test: validate install bundles-rootfs
-	go test -bench=. -v $(shell go list ./... | grep -v /vendor | grep -v /integration-test ) -runtime=$(RUNTIME)
-ifneq ($(wildcard /.dockerenv), )
-	cd integration-test ; \
-	go test -check.v -check.timeout=$(TEST_TIMEOUT) timeout=$(TEST_SUITE_TIMEOUT) $(TESTFLAGS) github.com/docker/containerd/integration-test
-endif
+integration: ## run integration tests
+	@echo "$(WHALE) $@"
+	@go test ${TESTFLAGS} -test.root -parallel ${TESTFLAGS_PARALLEL}
 
-bench: shim validate install bundles-rootfs
-	go test -bench=. -v $(shell go list ./... | grep -v /vendor | grep -v /integration-test) -runtime=$(RUNTIME)
+benchmark: ## run benchmarks tests
+	@echo "$(WHALE) $@"
+	@go test ${TESTFLAGS} -bench . -run Benchmark -test.root
 
-validate: fmt lint
+FORCE:
+
+# Build a binary from a cmd.
+bin/%: cmd/% FORCE
+	@echo "$(WHALE) $@${BINARY_SUFFIX}"
+	@go build ${GO_GCFLAGS} ${GO_BUILD_FLAGS} -o $@${BINARY_SUFFIX} ${GO_LDFLAGS} ${GO_TAGS}  ./$<
+
+bin/containerd-shim: cmd/containerd-shim FORCE # set !cgo and omit pie for a static shim build: https://github.com/golang/go/issues/17789#issuecomment-258542220
+	@echo "$(WHALE) bin/containerd-shim"
+	@CGO_ENABLED=0 go build ${GO_BUILD_FLAGS} -o bin/containerd-shim ${SHIM_GO_LDFLAGS} ${GO_TAGS} ./cmd/containerd-shim
+
+binaries: $(BINARIES) ## build binaries
+	@echo "$(WHALE) $@"
+
+man: mandir $(addprefix man/,$(MANPAGES))
+	@echo "$(WHALE) $@"
+
+mandir:
+	@mkdir -p man
+
+man/%: docs/man/%.md FORCE
+	@echo "$(WHALE) $<"
+	go-md2man -in "$<" -out "$@"
+
+define installmanpage
+mkdir -p $(DESTDIR)/man/man$(2);
+gzip -c $(1) >$(DESTDIR)/man/man$(2)/$(3).gz;
+endef
+
+install-man:
+	@echo "$(WHALE) $@"
+	$(foreach manpage,$(addprefix man/,$(MANPAGES)), $(call installmanpage,$(manpage),$(subst .,,$(suffix $(manpage))),$(notdir $(manpage))))
+
+release: $(BINARIES)
+	@echo "$(WHALE) $@"
+	@rm -rf releases/$(RELEASE) releases/$(RELEASE).tar.gz
+	@install -d releases/$(RELEASE)/bin
+	@install $(BINARIES) releases/$(RELEASE)/bin
+	@cd releases/$(RELEASE) && tar -czf ../$(RELEASE).tar.gz *
+
+clean: ## clean up binaries
+	@echo "$(WHALE) $@"
+	@rm -f $(BINARIES)
+
+install: ## install binaries
+	@echo "$(WHALE) $@ $(BINARIES)"
+	@mkdir -p $(DESTDIR)/bin
+	@install $(BINARIES) $(DESTDIR)/bin
 
 uninstall:
-	$(foreach file,containerd containerd-shim ctr,rm /usr/local/bin/$(file);)
+	@echo "$(WHALE) $@"
+	@rm -f $(addprefix $(DESTDIR)/bin/,$(notdir $(BINARIES)))
+
+
+coverage: ## generate coverprofiles from the unit tests, except tests that require root
+	@echo "$(WHALE) $@"
+	@rm -f coverage.txt
+	@go test -i ${TESTFLAGS} $(filter-out ${INTEGRATION_PACKAGE},${PACKAGES}) 2> /dev/null
+	@( for pkg in $(filter-out ${INTEGRATION_PACKAGE},${PACKAGES}); do \
+		go test ${TESTFLAGS} \
+			-cover \
+			-coverprofile=profile.out \
+			-covermode=atomic $$pkg || exit; \
+		if [ -f profile.out ]; then \
+			cat profile.out >> coverage.txt; \
+			rm profile.out; \
+		fi; \
+	done )
+
+root-coverage: ## generate coverage profiles for unit tests that require root
+	@echo "$(WHALE) $@"
+	@go test -i ${TESTFLAGS} $(filter-out ${INTEGRATION_PACKAGE},${TEST_REQUIRES_ROOT_PACKAGES}) 2> /dev/null
+	@( for pkg in $(filter-out ${INTEGRATION_PACKAGE},${TEST_REQUIRES_ROOT_PACKAGES}); do \
+		go test ${TESTFLAGS} \
+			-cover \
+			-coverprofile=profile.out \
+			-covermode=atomic $$pkg -test.root || exit; \
+		if [ -f profile.out ]; then \
+			cat profile.out >> coverage.txt; \
+			rm profile.out; \
+		fi; \
+	done )
+
+vendor:
+	@echo "$(WHALE) $@"
+	@vndr
+
+help: ## this help
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST) | sort
