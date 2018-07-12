@@ -20,4 +20,7 @@ const (
 	MediaTypeContainerd1CheckpointConfig  = "application/vnd.containerd.container.checkpoint.config.v1+proto"
 	// Legacy Docker schema1 manifest
 	MediaTypeDockerSchema1Manifest = "application/vnd.docker.distribution.manifest.v1+prettyjws"
+
+	// octet-stream Media Types
+	MediaTypeDockerOctetStreamConfig = "application/octet-stream"
 )

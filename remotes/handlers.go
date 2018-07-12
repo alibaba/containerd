@@ -34,7 +34,7 @@ func MakeRefKey(ctx context.Context, desc ocispec.Descriptor) string {
 		ocispec.MediaTypeImageLayer, ocispec.MediaTypeImageLayerGzip,
 		ocispec.MediaTypeImageLayerNonDistributable, ocispec.MediaTypeImageLayerNonDistributableGzip:
 		return "layer-" + desc.Digest.String()
-	case images.MediaTypeDockerSchema2Config, ocispec.MediaTypeImageConfig:
+	case images.MediaTypeDockerSchema2Config, ocispec.MediaTypeImageConfig, images.MediaTypeDockerOctetStreamConfig:
 		return "config-" + desc.Digest.String()
 	default:
 		log.G(ctx).Warnf("reference for unknown type: %s", desc.MediaType)

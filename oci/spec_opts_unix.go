@@ -75,7 +75,7 @@ func WithImageConfig(image Image) SpecOpts {
 			config   v1.ImageConfig
 		)
 		switch ic.MediaType {
-		case v1.MediaTypeImageConfig, images.MediaTypeDockerSchema2Config:
+		case v1.MediaTypeImageConfig, images.MediaTypeDockerSchema2Config, images.MediaTypeDockerOctetStreamConfig:
 			p, err := content.ReadBlob(ctx, image.ContentStore(), ic.Digest)
 			if err != nil {
 				return err
