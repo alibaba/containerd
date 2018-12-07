@@ -327,7 +327,8 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 		if readonly {
 			m, err = s.Snapshotter.View(ctx, bkey, bparent)
 		} else {
-			m, err = s.Snapshotter.Prepare(ctx, bkey, bparent)
+			// pass snapshot opts to Snapshotter Prepare
+			m, err = s.Snapshotter.Prepare(ctx, bkey, bparent, opts...)
 		}
 		return err
 	}); err != nil {
